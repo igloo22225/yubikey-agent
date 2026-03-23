@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
@@ -250,6 +251,7 @@ func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
 	switch cert.PublicKey.(type) {
 	case *ecdsa.PublicKey:
 	case *rsa.PublicKey:
+	case ed25519.PublicKey:
 	default:
 		return nil, fmt.Errorf("unexpected public key type: %T", cert.PublicKey)
 	}

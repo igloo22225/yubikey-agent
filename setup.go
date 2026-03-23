@@ -137,8 +137,16 @@ func runSetup(yk *piv.YubiKey) {
 		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
 	}
 
+	algorithm := piv.AlgorithmEC256
+	if supportsEd25519(yk) {
+		algorithm = piv.AlgorithmEd25519
+		log.Println("ℹ️ Using Ed25519 (firmware >= 5.7.0)")
+	} else {
+		log.Println("ℹ️ Using ECDSA P-256 (Ed25519 requires firmware >= 5.7.0)")
+	}
+
 	pub, err := yk.GenerateKey(key, piv.SlotAuthentication, piv.Key{
-		Algorithm:   piv.AlgorithmEC256,
+		Algorithm:   algorithm,
 		PINPolicy:   piv.PINPolicyOnce,
 		TouchPolicy: piv.TouchPolicyAlways,
 	})
@@ -150,6 +158,9 @@ func runSetup(yk *piv.YubiKey) {
 	if err != nil {
 		log.Fatalln("Failed to generate parent key:", err)
 	}
+	// Generate and store a certificate in the slot. We do this for two reasons:
+	// - We don't want to generate a fresh attestation every time we need the public key
+	// - We need to check if the slot is used when setting up (could be done with yk.KeyInfo on firmware >= 5.3.0)
 	parent := &x509.Certificate{
 		Subject: pkix.Name{
 			Organization:       []string{"yubikey-agent"},
@@ -194,6 +205,11 @@ func runSetup(yk *piv.YubiKey) {
 	fmt.Println(`set the SSH_AUTH_SOCK environment variable, and test with "ssh-add -L"`)
 	fmt.Println("")
 	fmt.Println("💭 Remember: everything breaks, have a backup plan for when this YubiKey does.")
+}
+
+func supportsEd25519(yk *piv.YubiKey) bool {
+	v := yk.Version()
+	return v.Major > 5 || (v.Major == 5 && v.Minor >= 7)
 }
 
 func randomSerialNumber() *big.Int {
