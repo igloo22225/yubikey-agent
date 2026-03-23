@@ -66,16 +66,74 @@ func runReset(yk *piv.YubiKey) {
 	}
 }
 
-func runSetup(yk *piv.YubiKey) {
-	if _, err := yk.Certificate(piv.SlotAuthentication); err == nil {
-		log.Println("‼️  This YubiKey looks already setup")
-		log.Println("")
-		log.Println("If you want to wipe all PIV keys and start fresh,")
-		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
-	} else if !errors.Is(err, piv.ErrNotFound) {
-		log.Fatalln("Failed to access authentication slot:", err)
+func runSetupSlots(yk *piv.YubiKey, slots []slotConfig, forceOverwrite bool) {
+	// Check for occupied slots (based on what the user submitted in their config)
+	var occupied []slotConfig
+	for _, sc := range slots {
+		if _, err := yk.Certificate(sc.Slot); err == nil {
+			occupied = append(occupied, sc)
+		} else if !errors.Is(err, piv.ErrNotFound) {
+			log.Fatalf("Failed to access slot %s: %v", slotDisplayName(sc), err)
+		}
 	}
 
+	if len(occupied) > 0 && !forceOverwrite {
+		log.Println("‼️  The following slots already have keys configured:")
+		for _, sc := range occupied {
+			log.Printf("  %s", slotDisplayName(sc))
+		}
+		log.Println("")
+		log.Println("If you want to wipe all PIV keys and start fresh,")
+		log.Println("use --really-delete-all-piv-keys ⚠️")
+		log.Println("")
+		log.Println("To set up an additional slot without wiping, use -slot:")
+		log.Println("  yubikey-agent -setup -slot Signature")
+		log.Fatalln("Possible slots: Authentication, Signature, KeyManagement, CardAuthentication")
+	}
+
+	// Determine whether this is a fresh device or a previously provisioned one.
+	// A fresh device will still have the default management key.
+	var key []byte
+	if err := yk.SetManagementKey(piv.DefaultManagementKey, piv.DefaultManagementKey); err == nil {
+		key = setupPINAndManagementKey(yk)
+	} else {
+		log.Println("Existing device configuration detected.")
+		fmt.Print("PIN: ")
+		pin, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Print("\n")
+		if err != nil {
+			log.Fatalln("Failed to read PIN:", err)
+		}
+		md, err := yk.Metadata(string(pin))
+		if err != nil {
+			log.Fatalln("Failed to retrieve management key (wrong PIN?):", err)
+		}
+		key = *md.ManagementKey
+	}
+
+	algorithm := piv.AlgorithmEC256
+	if supportsEd25519(yk) {
+		algorithm = piv.AlgorithmEd25519
+		log.Println("ℹ️  Using Ed25519 (firmware >= 5.7.0)")
+	} else {
+		log.Println("ℹ️  Using ECDSA P-256 (Ed25519 requires firmware >= 5.7.0)")
+	}
+
+	for _, sc := range slots {
+		generateAndStoreKey(yk, key, sc.Slot, algorithm)
+	}
+
+	fmt.Println("")
+	fmt.Println("✅ Done! This YubiKey is ready to go.")
+	fmt.Println("🤏 When the YubiKey blinks, touch it to authorize the login.")
+	fmt.Println("")
+	fmt.Println("Next steps: ensure yubikey-agent is running via launchd/systemd/...,")
+	fmt.Println(`set the SSH_AUTH_SOCK environment variable, and test with "ssh-add -L"`)
+	fmt.Println("")
+	fmt.Println("💭 Remember: everything breaks, have a backup plan for when this YubiKey does.")
+}
+
+func setupPINAndManagementKey(yk *piv.YubiKey) []byte {
 	fmt.Println("🔐 The PIN is up to 8 numbers, letters, or symbols. Not just numbers!")
 	fmt.Println("❌ The key will be lost if the PIN and PUK are locked after 3 incorrect tries.")
 	fmt.Println("")
@@ -137,15 +195,11 @@ func runSetup(yk *piv.YubiKey) {
 		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
 	}
 
-	algorithm := piv.AlgorithmEC256
-	if supportsEd25519(yk) {
-		algorithm = piv.AlgorithmEd25519
-		log.Println("ℹ️ Using Ed25519 (firmware >= 5.7.0)")
-	} else {
-		log.Println("ℹ️ Using ECDSA P-256 (Ed25519 requires firmware >= 5.7.0)")
-	}
+	return key
+}
 
-	pub, err := yk.GenerateKey(key, piv.SlotAuthentication, piv.Key{
+func generateAndStoreKey(yk *piv.YubiKey, managementKey []byte, slot piv.Slot, algorithm piv.Algorithm) {
+	pub, err := yk.GenerateKey(managementKey, slot, piv.Key{
 		Algorithm:   algorithm,
 		PINPolicy:   piv.PINPolicyOnce,
 		TouchPolicy: piv.TouchPolicyAlways,
@@ -185,7 +239,7 @@ func runSetup(yk *piv.YubiKey) {
 	if err != nil {
 		log.Fatalln("Failed to parse certificate:", err)
 	}
-	if err := yk.SetCertificate(key, piv.SlotAuthentication, cert); err != nil {
+	if err := yk.SetCertificate(managementKey, slot, cert); err != nil {
 		log.Fatalln("Failed to store certificate:", err)
 	}
 
@@ -195,16 +249,8 @@ func runSetup(yk *piv.YubiKey) {
 	}
 
 	fmt.Println("")
-	fmt.Println("✅ Done! This YubiKey is secured and ready to go.")
-	fmt.Println("🤏 When the YubiKey blinks, touch it to authorize the login.")
-	fmt.Println("")
-	fmt.Println("🔑 Here's your new shiny SSH public key:")
+	fmt.Printf("🔑 Slot %s SSH public key:\n", slot.String())
 	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
-	fmt.Println("")
-	fmt.Println("Next steps: ensure yubikey-agent is running via launchd/systemd/...,")
-	fmt.Println(`set the SSH_AUTH_SOCK environment variable, and test with "ssh-add -L"`)
-	fmt.Println("")
-	fmt.Println("💭 Remember: everything breaks, have a backup plan for when this YubiKey does.")
 }
 
 func supportsEd25519(yk *piv.YubiKey) bool {

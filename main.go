@@ -39,24 +39,56 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of yubikey-agent:\n")
 		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "  Setup:\n")
 		fmt.Fprintf(os.Stderr, "\tyubikey-agent -setup\n")
+		fmt.Fprintf(os.Stderr, "\t\tGenerate a key on the Authentication slot (default).\n")
 		fmt.Fprintf(os.Stderr, "\n")
-		fmt.Fprintf(os.Stderr, "\t\tGenerate a new SSH key on the attached YubiKey.\n")
+		fmt.Fprintf(os.Stderr, "\tyubikey-agent -setup -slot SLOT\n")
+		fmt.Fprintf(os.Stderr, "\t\tGenerate a key on a specific slot. Can be run on an already-\n")
+		fmt.Fprintf(os.Stderr, "\t\tprovisioned YubiKey to add a slot without wiping existing keys.\n")
 		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "\tyubikey-agent -setup -config CONFIG\n")
+		fmt.Fprintf(os.Stderr, "\t\tGenerate keys for all slots defined in the config file.\n")
+		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "  Agent:\n")
 		fmt.Fprintf(os.Stderr, "\tyubikey-agent -l PATH\n")
+		fmt.Fprintf(os.Stderr, "\t\tRun the agent with a single socket at PATH, using the\n")
+		fmt.Fprintf(os.Stderr, "\t\tAuthentication slot (9a). This is the default behavior.\n")
 		fmt.Fprintf(os.Stderr, "\n")
-		fmt.Fprintf(os.Stderr, "\t\tRun the agent, listening on the UNIX socket at PATH.\n")
+		fmt.Fprintf(os.Stderr, "\tyubikey-agent -l PATH -config CONFIG\n")
+		fmt.Fprintf(os.Stderr, "\t\tRun the agent with multiple sockets, one per slot defined\n")
+		fmt.Fprintf(os.Stderr, "\t\tin the config file. PATH is used as a base: each named slot\n")
+		fmt.Fprintf(os.Stderr, "\t\tproduces PATH-<name> (e.g. -l /tmp/agent.sock with a slot\n")
+		fmt.Fprintf(os.Stderr, "\t\tnamed \"main\" creates /tmp/agent.sock-main). A slot with an\n")
+		fmt.Fprintf(os.Stderr, "\t\tempty name (\"\") uses PATH as-is, with no suffix.\n")
+		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "  Slots:\n")
+		fmt.Fprintf(os.Stderr, "\tAuthentication     9a   (default when no config is provided)\n")
+		fmt.Fprintf(os.Stderr, "\tSignature          9c\n")
+		fmt.Fprintf(os.Stderr, "\tKeyManagement      9d\n")
+		fmt.Fprintf(os.Stderr, "\tCardAuthentication 9e\n")
 		fmt.Fprintf(os.Stderr, "\n")
 	}
 
 	socketPath := flag.String("l", "", "agent: path of the UNIX socket to listen on")
+	configPath := flag.String("config", "", "agent/setup: path to YAML config file for multi-slot support")
 	resetFlag := flag.Bool("really-delete-all-piv-keys", false, "setup: reset the PIV applet")
 	setupFlag := flag.Bool("setup", false, "setup: configure a new YubiKey")
+	setupSlot := flag.String("slot", "", "setup: PIV slot to configure (Authentication, Signature, KeyManagement, CardAuthentication)")
 	flag.Parse()
 
 	if flag.NArg() > 0 {
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	slots := defaultSlotConfig()
+	if *configPath != "" {
+		var err error
+		slots, err = loadConfig(*configPath)
+		if err != nil {
+			log.Fatalln("Failed to load config:", err)
+		}
 	}
 
 	if *setupFlag {
@@ -65,63 +97,96 @@ func main() {
 		if *resetFlag {
 			runReset(yk)
 		}
-		runSetup(yk)
+		if *setupSlot != "" {
+			sc, err := slotForSetup(*setupSlot)
+			if err != nil {
+				log.Fatalln(err)
+			}
+			runSetupSlots(yk, []slotConfig{sc}, *resetFlag)
+		} else {
+			runSetupSlots(yk, slots, *resetFlag)
+		}
 	} else {
 		if *socketPath == "" {
 			flag.Usage()
 			os.Exit(1)
 		}
-		runAgent(*socketPath)
+		runAgent(*socketPath, slots)
 	}
 }
 
-func runAgent(socketPath string) {
+func runAgent(socketPath string, slots []slotConfig) {
 	if terminal.IsTerminal(int(os.Stdin.Fd())) {
 		log.Println("Warning: yubikey-agent is meant to run as a background daemon.")
 		log.Println("Running multiple instances is likely to lead to conflicts.")
 		log.Println("Consider using the launchd or systemd services.")
 	}
 
-	a := &Agent{}
+	// All agents share a single YubiKey session and mutex, since PIV
+	// smartcards can only handle one transaction at a time.
+	var agents []*Agent
+	yks := &ykSession{mu: &sync.Mutex{}}
 
-	c := make(chan os.Signal)
+	for _, sc := range slots {
+		agentSocketPath := socketPathForSlot(socketPath, sc)
+		a := &Agent{yks: yks, slot: sc.Slot, slotConfig: sc}
+
+		os.Remove(agentSocketPath)
+		if err := os.MkdirAll(filepath.Dir(agentSocketPath), 0777); err != nil {
+			log.Fatalln("Failed to create UNIX socket folder:", err)
+		}
+		l, err := net.Listen("unix", agentSocketPath)
+		if err != nil {
+			log.Fatalln("Failed to listen on UNIX socket:", err)
+		}
+
+		log.Printf("Listening on %s (slot %s)", agentSocketPath, slotDisplayName(sc))
+
+		go func() {
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					type temporary interface {
+						Temporary() bool
+					}
+					if err, ok := err.(temporary); ok && err.Temporary() {
+						log.Println("Temporary Accept error, sleeping 1s:", err)
+						time.Sleep(1 * time.Second)
+						continue
+					}
+					log.Fatalln("Failed to accept connections:", err)
+				}
+				go a.serveConn(c)
+			}
+		}()
+
+		agents = append(agents, a)
+	}
+
+	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGHUP)
-	go func() {
-		for range c {
+	for range c {
+		for _, a := range agents {
 			a.Close()
 		}
-	}()
-
-	os.Remove(socketPath)
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0777); err != nil {
-		log.Fatalln("Failed to create UNIX socket folder:", err)
-	}
-	l, err := net.Listen("unix", socketPath)
-	if err != nil {
-		log.Fatalln("Failed to listen on UNIX socket:", err)
-	}
-
-	for {
-		c, err := l.Accept()
-		if err != nil {
-			type temporary interface {
-				Temporary() bool
-			}
-			if err, ok := err.(temporary); ok && err.Temporary() {
-				log.Println("Temporary Accept error, sleeping 1s:", err)
-				time.Sleep(1 * time.Second)
-				continue
-			}
-			log.Fatalln("Failed to accept connections:", err)
-		}
-		go a.serveConn(c)
 	}
 }
 
-type Agent struct {
-	mu     sync.Mutex
+// ykSession holds the shared YubiKey connection state. All Agent instances
+// share a single ykSession so that reconnections are visible across goroutines
+// and the physical smartcard is never accessed concurrently.
+type ykSession struct {
 	yk     *piv.YubiKey
+	mu     *sync.Mutex
 	serial uint32
+}
+
+// Agent services a single PIV slot over its own UNIX socket. Multiple Agents
+// share the same ykSession (and its mutex) to coordinate YubiKey access.
+type Agent struct {
+	yks        *ykSession
+	slot       piv.Slot
+	slotConfig slotConfig
 
 	// touchNotification is armed by Sign to show a notification if waiting for
 	// more than a few seconds for the touch operation. It is paused and reset
@@ -145,10 +210,10 @@ func healthy(yk *piv.YubiKey) bool {
 }
 
 func (a *Agent) ensureYK() error {
-	if a.yk == nil || !healthy(a.yk) {
-		if a.yk != nil {
+	if a.yks.yk == nil || !healthy(a.yks.yk) {
+		if a.yks.yk != nil {
 			log.Println("Reconnecting to the YubiKey...")
-			a.yk.Close()
+			a.yks.yk.Close()
 		} else {
 			log.Println("Connecting to the YubiKey...")
 		}
@@ -156,7 +221,7 @@ func (a *Agent) ensureYK() error {
 		if err != nil {
 			return err
 		}
-		a.yk = yk
+		a.yks.yk = yk
 	}
 	return nil
 }
@@ -165,13 +230,13 @@ func (a *Agent) maybeReleaseYK() {
 	// On macOS, YubiKey 5s persist the PIN cache even across sessions (and even
 	// processes), so we can release the lock on the key, to let other
 	// applications like age-plugin-yubikey use it.
-	if runtime.GOOS != "darwin" || a.yk.Version().Major < 5 {
+	if runtime.GOOS != "darwin" || a.yks.yk.Version().Major < 5 {
 		return
 	}
-	if err := a.yk.Close(); err != nil {
+	if err := a.yks.yk.Close(); err != nil {
 		log.Println("Failed to automatically release YubiKey lock:", err)
 	}
-	a.yk = nil
+	a.yks.yk = nil
 }
 
 func (a *Agent) connectToYK() (*piv.YubiKey, error) {
@@ -181,7 +246,7 @@ func (a *Agent) connectToYK() (*piv.YubiKey, error) {
 	}
 	// Cache the serial number locally because requesting it on older firmwares
 	// requires switching application, which drops the PIN cache.
-	a.serial, _ = yk.Serial()
+	a.yks.serial, _ = yk.Serial()
 	return yk, nil
 }
 
@@ -205,12 +270,12 @@ func openYK() (yk *piv.YubiKey, err error) {
 }
 
 func (a *Agent) Close() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.yk != nil {
+	a.yks.mu.Lock()
+	defer a.yks.mu.Unlock()
+	if a.yks.yk != nil {
 		log.Println("Received HUP, dropping YubiKey transaction...")
-		err := a.yk.Close()
-		a.yk = nil
+		err := a.yks.yk.Close()
+		a.yks.yk = nil
 		return err
 	}
 	return nil
@@ -220,26 +285,26 @@ func (a *Agent) getPIN() (string, error) {
 	if a.touchNotification != nil && a.touchNotification.Stop() {
 		defer a.touchNotification.Reset(5 * time.Second)
 	}
-	r, _ := a.yk.Retries()
-	return getPIN(a.serial, r)
+	r, _ := a.yks.yk.Retries()
+	return getPIN(a.yks.serial, r)
 }
 
 func (a *Agent) List() ([]*agent.Key, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.yks.mu.Lock()
+	defer a.yks.mu.Unlock()
 	if err := a.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
 	defer a.maybeReleaseYK()
 
-	pk, err := getPublicKey(a.yk, piv.SlotAuthentication)
+	pk, err := getPublicKey(a.yks.yk, a.slot)
 	if err != nil {
 		return nil, err
 	}
 	return []*agent.Key{{
 		Format:  pk.Type(),
 		Blob:    pk.Marshal(),
-		Comment: fmt.Sprintf("YubiKey #%d PIV Slot 9a", a.serial),
+		Comment: fmt.Sprintf("YubiKey #%d PIV Slot %s", a.yks.serial, slotDisplayName(a.slotConfig)),
 	}}, nil
 }
 
@@ -263,8 +328,8 @@ func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
 }
 
 func (a *Agent) Signers() ([]ssh.Signer, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.yks.mu.Lock()
+	defer a.yks.mu.Unlock()
 	if err := a.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
@@ -274,12 +339,12 @@ func (a *Agent) Signers() ([]ssh.Signer, error) {
 }
 
 func (a *Agent) signers() ([]ssh.Signer, error) {
-	pk, err := getPublicKey(a.yk, piv.SlotAuthentication)
+	pk, err := getPublicKey(a.yks.yk, a.slot)
 	if err != nil {
 		return nil, err
 	}
-	priv, err := a.yk.PrivateKey(
-		piv.SlotAuthentication,
+	priv, err := a.yks.yk.PrivateKey(
+		a.slot,
 		pk.(ssh.CryptoPublicKey).CryptoPublicKey(),
 		piv.KeyAuth{PINPrompt: a.getPIN},
 	)
@@ -298,8 +363,8 @@ func (a *Agent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 }
 
 func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.yks.mu.Lock()
+	defer a.yks.mu.Unlock()
 	if err := a.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}

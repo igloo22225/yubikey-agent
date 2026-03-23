@@ -1,0 +1,12 @@
+# Multiple distinct keys can be held on a Yubikey in PIV mode. One socket will be created for each keyslot. 
+# It's a bad idea to do this if you use the PIV slots for their intended purposes (i.e. don't do this except on a PIV device you will only use for yubikey-agent).
+- keyslots:
+  # Slot 9A: PIV Authentication
+  # On a config-less installation, this slot will be used
+  - Authentication: "main"
+  # Slot 9C: Digital Signature
+  - Signature: "repositories"
+  # Slot 9D: Key Management
+  - KeyManagement: "backup"
+  # Slot 9E: Card Authentication (null = socket will not be run / keys will not be configured)
+  - CardAuthentication:
