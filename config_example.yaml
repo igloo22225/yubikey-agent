@@ -10,3 +10,24 @@
   - KeyManagement: "backup"
   # Slot 9E: Card Authentication (null = socket will not be run / keys will not be configured)
   - CardAuthentication:
+  # Additional "Retired" Slots which can be used for additional keys
+  - 82: "testing"
+  - 83:
+  - 84:
+  - 85:
+  - 86:
+  - 87:
+  - 88:
+  - 89:
+  - 8a:
+  - 8b:
+  - 8c:
+  - 8d:
+  - 8e:
+  - 8f:
+  - 90:
+  - 91:
+  - 92:
+  - 93:
+  - 94:
+  - 95:

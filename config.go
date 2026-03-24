@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/go-piv/piv-go/v2/piv"
 	"gopkg.in/yaml.v3"
@@ -13,6 +14,21 @@ var slotNames = map[string]piv.Slot{
 	"Signature":          piv.SlotSignature,
 	"KeyManagement":      piv.SlotKeyManagement,
 	"CardAuthentication": piv.SlotCardAuthentication,
+}
+
+func parseRetiredSlot(name string) (piv.Slot, bool) {
+	id, err := strconv.ParseUint(name, 16, 32)
+	if err != nil {
+		return piv.Slot{}, false
+	}
+	return piv.RetiredKeyManagementSlot(uint32(id))
+}
+
+func lookupSlot(name string) (piv.Slot, bool) {
+	if slot, ok := slotNames[name]; ok {
+		return slot, true
+	}
+	return parseRetiredSlot(name)
 }
 
 type slotConfig struct {
@@ -43,9 +59,9 @@ func loadConfig(path string) ([]slotConfig, error) {
 	seen := make(map[string]bool)
 	for _, entry := range cfg[0].Keyslots {
 		for name, socketName := range entry {
-			slot, ok := slotNames[name]
+			slot, ok := lookupSlot(name)
 			if !ok {
-				return nil, fmt.Errorf("unknown slot name %q", name)
+				return nil, fmt.Errorf("unknown slot name %q (use a named slot like Authentication, Signature, KeyManagement, CardAuthentication, or a retired slot hex ID 82-95)", name)
 			}
 			if socketName == nil {
 				continue // null value means skip this slot
@@ -84,13 +100,17 @@ func slotDisplayName(sc slotConfig) string {
 			return name
 		}
 	}
-	return sc.Slot.String()
+	hex := sc.Slot.String()
+	if sc.Name != "" {
+		return fmt.Sprintf("Retired(%s) / %s", hex, sc.Name)
+	}
+	return fmt.Sprintf("Retired(%s)", hex)
 }
 
 func slotForSetup(name string) (slotConfig, error) {
-	slot, ok := slotNames[name]
+	slot, ok := lookupSlot(name)
 	if !ok {
-		return slotConfig{}, fmt.Errorf("unknown slot name %q", name)
+		return slotConfig{}, fmt.Errorf("unknown slot name %q (use a named slot like Authentication, Signature, KeyManagement, CardAuthentication, or a retired slot hex ID 82-95)", name)
 	}
 	return slotConfig{Slot: slot, Name: name}, nil
 }

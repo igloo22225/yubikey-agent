@@ -88,7 +88,7 @@ func runSetupSlots(yk *piv.YubiKey, slots []slotConfig, forceOverwrite bool) {
 		log.Println("")
 		log.Println("To set up an additional slot without wiping, use -slot:")
 		log.Println("  yubikey-agent -setup -slot Signature")
-		log.Fatalln("Possible slots: Authentication, Signature, KeyManagement, CardAuthentication")
+		log.Fatalln("Possible slots: Authentication, Signature, KeyManagement, CardAuthentication, or retired slots 82-95")
 	}
 
 	// Determine whether this is a fresh device or a previously provisioned one.

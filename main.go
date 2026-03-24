@@ -67,6 +67,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\tSignature          9c\n")
 		fmt.Fprintf(os.Stderr, "\tKeyManagement      9d\n")
 		fmt.Fprintf(os.Stderr, "\tCardAuthentication 9e\n")
+		fmt.Fprintf(os.Stderr, "\tRetired            82-95 (hex; use the ID in config or -slot)\n")
 		fmt.Fprintf(os.Stderr, "\n")
 	}
 
@@ -74,7 +75,7 @@ func main() {
 	configPath := flag.String("config", "", "agent/setup: path to YAML config file for multi-slot support")
 	resetFlag := flag.Bool("really-delete-all-piv-keys", false, "setup: reset the PIV applet")
 	setupFlag := flag.Bool("setup", false, "setup: configure a new YubiKey")
-	setupSlot := flag.String("slot", "", "setup: PIV slot to configure (Authentication, Signature, KeyManagement, CardAuthentication)")
+	setupSlot := flag.String("slot", "", "setup: PIV slot to configure (Authentication, Signature, KeyManagement, CardAuthentication, or retired slot 82-95)")
 	flag.Parse()
 
 	if flag.NArg() > 0 {
