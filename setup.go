@@ -66,7 +66,7 @@ func runReset(yk *piv.YubiKey) {
 	}
 }
 
-func runSetupSlots(yk *piv.YubiKey, slots []slotConfig, forceOverwrite bool) {
+func runSetupSlots(yk *piv.YubiKey, slots []slotConfig, forceOverwrite bool, attestation bool) {
 	// Check for occupied slots (based on what the user submitted in their config)
 	var occupied []slotConfig
 	for _, sc := range slots {
@@ -120,7 +120,7 @@ func runSetupSlots(yk *piv.YubiKey, slots []slotConfig, forceOverwrite bool) {
 	}
 
 	for _, sc := range slots {
-		generateAndStoreKey(yk, key, sc.Slot, algorithm)
+		generateAndStoreKey(yk, key, sc.Slot, algorithm, attestation)
 	}
 
 	fmt.Println("")
@@ -198,7 +198,7 @@ func setupPINAndManagementKey(yk *piv.YubiKey) []byte {
 	return key
 }
 
-func generateAndStoreKey(yk *piv.YubiKey, managementKey []byte, slot piv.Slot, algorithm piv.Algorithm) {
+func generateAndStoreKey(yk *piv.YubiKey, managementKey []byte, slot piv.Slot, algorithm piv.Algorithm, attestation bool) {
 	pub, err := yk.GenerateKey(managementKey, slot, piv.Key{
 		Algorithm:   algorithm,
 		PINPolicy:   piv.PINPolicyOnce,
@@ -251,6 +251,10 @@ func generateAndStoreKey(yk *piv.YubiKey, managementKey []byte, slot piv.Slot, a
 	fmt.Println("")
 	fmt.Printf("🔑 Slot %s SSH public key:\n", slot.String())
 	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
+	if attestation {
+		fmt.Printf("🧾 Slot %s Attestation:\n", slot.String())
+		fmt.Println(generateValidationCert(yk, slot))
+	}
 }
 
 func supportsEd25519(yk *piv.YubiKey) bool {

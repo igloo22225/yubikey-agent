@@ -50,6 +50,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\tyubikey-agent -setup -config CONFIG\n")
 		fmt.Fprintf(os.Stderr, "\t\tGenerate keys for all slots defined in the config file.\n")
 		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "  Dump:\n")
+		fmt.Fprintf(os.Stderr, "\tyubikey-agent -dump\n")
+		fmt.Fprintf(os.Stderr, "\t\tShow all public keys on the connected YubiKey for slots\n")
+		fmt.Fprintf(os.Stderr, "\t\tdefined in the config (or the Authentication slot by default).\n")
+		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "\tyubikey-agent -dump -config CONFIG\n")
+		fmt.Fprintf(os.Stderr, "\t\tShow all public keys for slots in the config file. If\n")
+		fmt.Fprintf(os.Stderr, "\t\tattestation is enabled in the config, attestation strings\n")
+		fmt.Fprintf(os.Stderr, "\t\tare printed alongside each key.\n")
+		fmt.Fprintf(os.Stderr, "\n")
 		fmt.Fprintf(os.Stderr, "  Agent:\n")
 		fmt.Fprintf(os.Stderr, "\tyubikey-agent -l PATH\n")
 		fmt.Fprintf(os.Stderr, "\t\tRun the agent with a single socket at PATH, using the\n")
@@ -72,10 +82,11 @@ func main() {
 	}
 
 	socketPath := flag.String("l", "", "agent: path of the UNIX socket to listen on")
-	configPath := flag.String("config", "", "agent/setup: path to YAML config file for multi-slot support")
+	configPath := flag.String("config", "", "agent/setup: path to YAML config file")
 	resetFlag := flag.Bool("really-delete-all-piv-keys", false, "setup: reset the PIV applet")
 	setupFlag := flag.Bool("setup", false, "setup: configure a new YubiKey")
 	setupSlot := flag.String("slot", "", "setup: PIV slot to configure (Authentication, Signature, KeyManagement, CardAuthentication, or retired slot 82-95)")
+	dumpFlag := flag.Bool("dump", false, "dump: show all public keys on the connected YubiKey")
 	flag.Parse()
 
 	if flag.NArg() > 0 {
@@ -83,16 +94,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	slots := defaultSlotConfig()
+	cfg := parsedConfig{Slots: defaultSlotConfig()}
 	if *configPath != "" {
 		var err error
-		slots, err = loadConfig(*configPath)
+		cfg, err = loadConfig(*configPath)
 		if err != nil {
 			log.Fatalln("Failed to load config:", err)
 		}
 	}
 
-	if *setupFlag {
+	if *dumpFlag {
+		log.SetFlags(0)
+		yk := connectForSetup()
+		printKeys(yk, cfg.Slots, cfg.Attestation)
+	} else if *setupFlag {
 		log.SetFlags(0)
 		yk := connectForSetup()
 		if *resetFlag {
@@ -103,16 +118,16 @@ func main() {
 			if err != nil {
 				log.Fatalln(err)
 			}
-			runSetupSlots(yk, []slotConfig{sc}, *resetFlag)
+			runSetupSlots(yk, []slotConfig{sc}, *resetFlag, cfg.Attestation)
 		} else {
-			runSetupSlots(yk, slots, *resetFlag)
+			runSetupSlots(yk, cfg.Slots, *resetFlag, cfg.Attestation)
 		}
 	} else {
 		if *socketPath == "" {
 			flag.Usage()
 			os.Exit(1)
 		}
-		runAgent(*socketPath, slots)
+		runAgent(*socketPath, cfg.Slots)
 	}
 }
 

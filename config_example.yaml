@@ -31,3 +31,7 @@
   - 93:
   - 94:
   - 95:
+# attestation: when true, attestation certificates are printed during key generation (-setup) and when dumping keys (-dump). The attestation string
+# contains the base64-encoded attestation and intermediate certificates separated by a pipe (|). These certificates can be used to verify whether
+# a paticular public key was generated on Yubikey hardware and the relevant key policies. Default: false.
+- attestation: false
