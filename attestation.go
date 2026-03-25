@@ -35,7 +35,11 @@ func printKeys(yk *piv.YubiKey, slots []slotConfig, includeAttestations bool) {
 			}
 		} else {
 			fmt.Printf("------------------------------\n")
-			fmt.Printf("Key (%s): %s", name, ssh.MarshalAuthorizedKey(key))
+			label := "Key"
+			if sc.Purpose == PurposeEncryption {
+				label = "Key [encryption only - will not work for SSH]"
+			}
+			fmt.Printf("%s (%s): %s", label, name, ssh.MarshalAuthorizedKey(key))
 			if includeAttestations {
 				fmt.Printf("Attestation (%s): %s\n", name, generateValidationCert(yk, sc.Slot))
 			}

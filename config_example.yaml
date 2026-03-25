@@ -3,16 +3,26 @@
 - keyslots:
   # Slot 9A: PIV Authentication
   # On a config-less installation, this slot will be used
-  - Authentication: "main"
-  # Slot 9C: Digital Signature
-  - Signature: "repositories"
+  - Authentication:
+    # Keyslots are allocated a name which will be used as a socket suffix.
+    - name: "main"
+    # Keyslots may have one of two purposes: signature (for authentication / signing; ex. SSH) and encryption (for ECDH). Default: "signature"
+    - purpose: "signature"
+  # Slot 9C: Digital Signature (note: this slot *could* be used for encryption; the slot name of Signature does not restrict it's use)
+  - Signature:
+    - name: "repositories"
   # Slot 9D: Key Management
-  - KeyManagement: "backup"
+  - KeyManagement:
+    - name: "backup"
   # Slot 9E: Card Authentication (null = socket will not be run / keys will not be configured)
   - CardAuthentication:
   # Additional "Retired" Slots which can be used for additional keys
-  - 82: "testing"
-  - 83:
+  - 82:
+    - name: "testing-signature"
+    - purpose: "signature"
+  - 83: 
+    - name: "testing-encryption"
+    - purpose: "encryption"
   - 84:
   - 85:
   - 86:

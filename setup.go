@@ -8,12 +8,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -66,14 +66,28 @@ func runReset(yk *piv.YubiKey) {
 	}
 }
 
+func slotOccupied(yk *piv.YubiKey, slot piv.Slot) bool {
+	if _, err := yk.Certificate(slot); err == nil {
+		return true
+	}
+	// Fall back to KeyInfo for key types that can't be stored in certificates
+	// (X25519). KeyInfo requires firmware >= 5.3.0; only attempt this on
+	// firmware that could support X25519 (>= 5.7.0) to avoid confusing
+	// errors on older devices.
+	if supportsEd25519(yk) {
+		if ki, err := yk.KeyInfo(slot); err == nil && ki.PublicKey != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func runSetupSlots(yk *piv.YubiKey, slots []slotConfig, forceOverwrite bool, attestation bool) {
 	// Check for occupied slots (based on what the user submitted in their config)
 	var occupied []slotConfig
 	for _, sc := range slots {
-		if _, err := yk.Certificate(sc.Slot); err == nil {
+		if slotOccupied(yk, sc.Slot) {
 			occupied = append(occupied, sc)
-		} else if !errors.Is(err, piv.ErrNotFound) {
-			log.Fatalf("Failed to access slot %s: %v", slotDisplayName(sc), err)
 		}
 	}
 
@@ -111,16 +125,16 @@ func runSetupSlots(yk *piv.YubiKey, slots []slotConfig, forceOverwrite bool, att
 		key = *md.ManagementKey
 	}
 
-	algorithm := piv.AlgorithmEC256
+	sigAlgorithm := piv.AlgorithmEC256
 	if supportsEd25519(yk) {
-		algorithm = piv.AlgorithmEd25519
-		log.Println("ℹ️  Using Ed25519 (firmware >= 5.7.0)")
+		sigAlgorithm = piv.AlgorithmEd25519
+		log.Println("ℹ️  Using Ed25519 for signature slots, x25519 for encryption slots (firmware >= 5.7.0)")
 	} else {
-		log.Println("ℹ️  Using ECDSA P-256 (Ed25519 requires firmware >= 5.7.0)")
+		log.Println("ℹ️  Using ECDSA P-256 for signature and encryptionslots (Ed25519 requires firmware >= 5.7.0)")
 	}
 
 	for _, sc := range slots {
-		generateAndStoreKey(yk, key, sc.Slot, algorithm, attestation)
+		generateAndStoreKey(yk, key, sc, sigAlgorithm, attestation)
 	}
 
 	fmt.Println("")
@@ -198,8 +212,11 @@ func setupPINAndManagementKey(yk *piv.YubiKey) []byte {
 	return key
 }
 
-func generateAndStoreKey(yk *piv.YubiKey, managementKey []byte, slot piv.Slot, algorithm piv.Algorithm, attestation bool) {
-	pub, err := yk.GenerateKey(managementKey, slot, piv.Key{
+func generateAndStoreKey(yk *piv.YubiKey, managementKey []byte, sc slotConfig, algorithm piv.Algorithm, attestation bool) {
+	if sc.Purpose == PurposeEncryption && supportsEd25519(yk) {
+		algorithm = piv.AlgorithmX25519
+	}
+	pub, err := yk.GenerateKey(managementKey, sc.Slot, piv.Key{
 		Algorithm:   algorithm,
 		PINPolicy:   piv.PINPolicyOnce,
 		TouchPolicy: piv.TouchPolicyAlways,
@@ -207,53 +224,70 @@ func generateAndStoreKey(yk *piv.YubiKey, managementKey []byte, slot piv.Slot, a
 	if err != nil {
 		log.Fatalln("Failed to generate key:", err)
 	}
+	var sshKey ssh.PublicKey
 
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		log.Fatalln("Failed to generate parent key:", err)
-	}
-	// Generate and store a certificate in the slot. We do this for two reasons:
-	// - We don't want to generate a fresh attestation every time we need the public key
-	// - We need to check if the slot is used when setting up (could be done with yk.KeyInfo on firmware >= 5.3.0)
-	parent := &x509.Certificate{
-		Subject: pkix.Name{
-			Organization:       []string{"yubikey-agent"},
-			OrganizationalUnit: []string{Version},
-		},
-		PublicKey: priv.Public(),
-	}
-	template := &x509.Certificate{
-		Subject: pkix.Name{
-			CommonName: "SSH key",
-		},
-		NotAfter:     time.Now().AddDate(42, 0, 0),
-		NotBefore:    time.Now(),
-		SerialNumber: randomSerialNumber(),
-		KeyUsage:     x509.KeyUsageKeyAgreement | x509.KeyUsageDigitalSignature,
-	}
-	certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
-	if err != nil {
-		log.Fatalln("Failed to generate certificate:", err)
-	}
-	cert, err := x509.ParseCertificate(certBytes)
-	if err != nil {
-		log.Fatalln("Failed to parse certificate:", err)
-	}
-	if err := yk.SetCertificate(managementKey, slot, cert); err != nil {
-		log.Fatalln("Failed to store certificate:", err)
+	if algorithm == piv.AlgorithmEC256 || algorithm == piv.AlgorithmEd25519 {
+		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			log.Fatalln("Failed to generate parent key:", err)
+		}
+		// Generate and store a certificate in the slot. We do this for two reasons:
+		// - We don't want to generate a fresh attestation every time we need the public key
+		// - We need to check if the slot is used when setting up (could be done with yk.KeyInfo on firmware >= 5.3.0)
+		parent := &x509.Certificate{
+			Subject: pkix.Name{
+				Organization:       []string{"yubikey-agent"},
+				OrganizationalUnit: []string{Version},
+			},
+			PublicKey: priv.Public(),
+		}
+		template := &x509.Certificate{
+			Subject: pkix.Name{
+				CommonName: "SSH key",
+			},
+			NotAfter:     time.Now().AddDate(42, 0, 0),
+			NotBefore:    time.Now(),
+			SerialNumber: randomSerialNumber(),
+			KeyUsage:     x509.KeyUsageKeyAgreement | x509.KeyUsageDigitalSignature,
+		}
+		certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
+		if err != nil {
+			log.Fatalln("Failed to generate certificate:", err)
+		}
+		cert, err := x509.ParseCertificate(certBytes)
+		if err != nil {
+			log.Fatalln("Failed to parse certificate:", err)
+		}
+		if err := yk.SetCertificate(managementKey, sc.Slot, cert); err != nil {
+			log.Fatalln("Failed to store certificate:", err)
+		}
+		sshKey, err = ssh.NewPublicKey(pub)
+		if err != nil {
+			log.Fatalln("Failed to generate public key:", err)
+		}
+	} else if algorithm == piv.AlgorithmX25519 {
+		// X.509 doesn't support X25519 public keys
+		ecdhPub, ok := pub.(*ecdh.PublicKey)
+		if !ok {
+			log.Fatalln("Expected X25519 public key, got:", fmt.Sprintf("%T", pub))
+		}
+		sshKey = newX25519SSHPublicKey(ecdhPub)
+	} else {
+		log.Fatalln("Unknown algorithm:", algorithm)
 	}
 
-	sshKey, err := ssh.NewPublicKey(pub)
-	if err != nil {
-		log.Fatalln("Failed to generate public key:", err)
+	keyMsg := ""
+
+	if sc.Purpose == PurposeEncryption {
+		keyMsg = " [encryption only - will not work for SSH]"
 	}
 
 	fmt.Println("")
-	fmt.Printf("🔑 Slot %s SSH public key:\n", slot.String())
+	fmt.Printf("🔑 Slot %s SSH public key%s:\n", sc.Slot.String(), keyMsg)
 	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
 	if attestation {
-		fmt.Printf("🧾 Slot %s Attestation:\n", slot.String())
-		fmt.Println(generateValidationCert(yk, slot))
+		fmt.Printf("🧾 Slot %s Attestation:\n", sc.Slot.String())
+		fmt.Println(generateValidationCert(yk, sc.Slot))
 	}
 }
 

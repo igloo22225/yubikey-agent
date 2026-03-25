@@ -9,8 +9,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
@@ -131,6 +134,41 @@ func main() {
 	}
 }
 
+func validateSlotPurposes(yk *piv.YubiKey, slots []slotConfig) error {
+	for _, sc := range slots {
+		pub, err := getCryptoPublicKey(yk, sc.Slot)
+		if err != nil {
+			continue
+		}
+		switch sc.Purpose {
+		case PurposeEncryption:
+			switch p := pub.(type) {
+			case *ecdsa.PublicKey:
+				if p.Curve != elliptic.P256() {
+					return fmt.Errorf("slot %s is configured for encryption but contains an ECDSA key on curve %s (only NIST P-256 and X25519 are supported)",
+						slotDisplayName(sc), p.Curve.Params().Name)
+				}
+			case *ecdh.PublicKey:
+				if p.Curve() != ecdh.X25519() {
+					return fmt.Errorf("slot %s is configured for encryption but contains an ECDH key (only NIST P-256 and X25519 are supported)",
+						slotDisplayName(sc))
+				}
+			default:
+				return fmt.Errorf("slot %s is configured for encryption but contains a %T key (expected ECDSA P-256 or X25519)",
+					slotDisplayName(sc), pub)
+			}
+		default:
+			switch pub.(type) {
+			case *ecdsa.PublicKey, ed25519.PublicKey, *rsa.PublicKey:
+			default:
+				return fmt.Errorf("slot %s is configured for signature but contains a %T key (expected ECDSA, Ed25519, or RSA)",
+					slotDisplayName(sc), pub)
+			}
+		}
+	}
+	return nil
+}
+
 func runAgent(socketPath string, slots []slotConfig) {
 	if terminal.IsTerminal(int(os.Stdin.Fd())) {
 		log.Println("Warning: yubikey-agent is meant to run as a background daemon.")
@@ -142,6 +180,15 @@ func runAgent(socketPath string, slots []slotConfig) {
 	// smartcards can only handle one transaction at a time.
 	var agents []*Agent
 	yks := &ykSession{mu: &sync.Mutex{}}
+
+	if yk, err := openYK(); err == nil {
+		yks.serial, _ = yk.Serial()
+		if err := validateSlotPurposes(yk, slots); err != nil {
+			yk.Close()
+			log.Fatalln("Slot configuration mismatch:", err)
+		}
+		yks.yk = yk
+	}
 
 	for _, sc := range slots {
 		agentSocketPath := socketPathForSlot(socketPath, sc)
@@ -325,22 +372,44 @@ func (a *Agent) List() ([]*agent.Key, error) {
 }
 
 func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
-	cert, err := yk.Certificate(slot)
+	pubKey, err := getCryptoPublicKey(yk, slot)
 	if err != nil {
-		return nil, fmt.Errorf("could not get public key: %w", err)
+		return nil, err
 	}
-	switch cert.PublicKey.(type) {
+	// X25519 keys are not supported by ssh.NewPublicKey; wrap them in our
+	// custom type that uses the ssh-ed25519 wire format.
+	if ecdhPub, ok := pubKey.(*ecdh.PublicKey); ok {
+		return newX25519SSHPublicKey(ecdhPub), nil
+	}
+	switch pubKey.(type) {
 	case *ecdsa.PublicKey:
 	case *rsa.PublicKey:
 	case ed25519.PublicKey:
 	default:
-		return nil, fmt.Errorf("unexpected public key type: %T", cert.PublicKey)
+		return nil, fmt.Errorf("unexpected public key type: %T", pubKey)
 	}
-	pk, err := ssh.NewPublicKey(cert.PublicKey)
+	pk, err := ssh.NewPublicKey(pubKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to process public key: %w", err)
 	}
 	return pk, nil
+}
+
+func getCryptoPublicKey(yk *piv.YubiKey, slot piv.Slot) (crypto.PublicKey, error) {
+	cert, err := yk.Certificate(slot)
+	if err != nil {
+		if supportsEd25519(yk) {
+			// KeyInfo is only available on firmware >= 5.3.0
+			// We only need to call this to check for x25519 keys due to them lacking certificates
+			// Thus, we'll only call it if there's a chance it could be an x25519 key
+			ki, kiErr := yk.KeyInfo(slot)
+			if kiErr == nil {
+				return ki.PublicKey, nil
+			}
+		}
+		return nil, fmt.Errorf("could not get public key: %w", err)
+	}
+	return cert.PublicKey, nil
 }
 
 func (a *Agent) Signers() ([]ssh.Signer, error) {
@@ -351,27 +420,31 @@ func (a *Agent) Signers() ([]ssh.Signer, error) {
 	}
 	defer a.maybeReleaseYK()
 
-	return a.signers()
+	s, err := a.signer()
+	if err != nil {
+		return nil, err
+	}
+	return []ssh.Signer{s}, nil
 }
 
-func (a *Agent) signers() ([]ssh.Signer, error) {
-	pk, err := getPublicKey(a.yks.yk, a.slot)
+func (a *Agent) signer() (*yubiKeySigner, error) {
+	pub, err := getCryptoPublicKey(a.yks.yk, a.slot)
 	if err != nil {
 		return nil, err
 	}
 	priv, err := a.yks.yk.PrivateKey(
 		a.slot,
-		pk.(ssh.CryptoPublicKey).CryptoPublicKey(),
+		pub,
 		piv.KeyAuth{PINPrompt: a.getPIN},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare private key: %w", err)
 	}
-	s, err := ssh.NewSignerFromKey(priv)
+	s, err := NewSignerFromKey(priv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare signer: %w", err)
 	}
-	return []ssh.Signer{s}, nil
+	return s, nil
 }
 
 func (a *Agent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
@@ -386,39 +459,63 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 	}
 	defer a.maybeReleaseYK()
 
-	signers, err := a.signers()
+	s, err := a.signer()
 	if err != nil {
 		return nil, err
 	}
-	for _, s := range signers {
-		if !bytes.Equal(s.PublicKey().Marshal(), key.Marshal()) {
-			continue
-		}
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		a.touchNotification = time.NewTimer(5 * time.Second)
-		go func() {
-			select {
-			case <-a.touchNotification.C:
-			case <-ctx.Done():
-				a.touchNotification.Stop()
-				return
-			}
-			showNotification("Waiting for YubiKey touch...")
-		}()
-
-		alg := key.Type()
-		switch {
-		case alg == ssh.KeyAlgoRSA && flags&agent.SignatureFlagRsaSha256 != 0:
-			alg = ssh.SigAlgoRSASHA2256
-		case alg == ssh.KeyAlgoRSA && flags&agent.SignatureFlagRsaSha512 != 0:
-			alg = ssh.SigAlgoRSASHA2512
-		}
-		// TODO: maybe retry if the PIN is not correct?
-		return s.(ssh.AlgorithmSigner).SignWithAlgorithm(rand.Reader, data, alg)
+	pk, err := getPublicKey(a.yks.yk, a.slot)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("no private keys match the requested public key")
+	if !bytes.Equal(pk.Marshal(), key.Marshal()) {
+		return nil, fmt.Errorf("no private keys match the requested public key")
+	}
+
+	ecdhP256 := flags&SignatureFlagECDH != 0
+	ecdhX25519 := flags&SignatureFlagX25519ECDH != 0
+	isECDH := ecdhP256 || ecdhX25519
+
+	if ecdhP256 && ecdhX25519 {
+		return nil, errors.New("cannot set both ECDH and X25519 ECDH flags")
+	}
+
+	if isECDH && a.slotConfig.Purpose != PurposeEncryption {
+		return nil, fmt.Errorf("ECDH requested on slot %s which is configured for %s, not encryption",
+			slotDisplayName(a.slotConfig), a.slotConfig.Purpose)
+	}
+	if !isECDH && a.slotConfig.Purpose == PurposeEncryption {
+		return nil, fmt.Errorf("signature requested on slot %s which is configured for encryption only",
+			slotDisplayName(a.slotConfig))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.touchNotification = time.NewTimer(5 * time.Second)
+	go func() {
+		select {
+		case <-a.touchNotification.C:
+		case <-ctx.Done():
+			a.touchNotification.Stop()
+			return
+		}
+		showNotification("Waiting for YubiKey touch...")
+	}()
+
+	alg := key.Type()
+	switch {
+	case alg == ssh.KeyAlgoRSA && flags&agent.SignatureFlagRsaSha256 != 0:
+		alg = ssh.SigAlgoRSASHA2256
+	case alg == ssh.KeyAlgoRSA && flags&agent.SignatureFlagRsaSha512 != 0:
+		alg = ssh.SigAlgoRSASHA2512
+	case alg == ssh.KeyAlgoECDSA256 && ecdhP256:
+		alg = KeyAlgoECDH256
+	case alg == "x25519" && ecdhX25519:
+		alg = KeyAlgoECDHX25519
+	}
+
+	// TODO: maybe retry if the PIN is not correct?
+	return s.SignWithAlgorithm(rand.Reader, data, alg)
 }
 
 func showNotification(message string) {

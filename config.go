@@ -9,6 +9,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type SlotPurpose string
+
+const (
+	PurposeSignature  SlotPurpose = "signature"
+	PurposeEncryption SlotPurpose = "encryption"
+)
+
 var slotNames = map[string]piv.Slot{
 	"Authentication":     piv.SlotAuthentication,
 	"Signature":          piv.SlotSignature,
@@ -32,18 +39,52 @@ func lookupSlot(name string) (piv.Slot, bool) {
 }
 
 type slotConfig struct {
-	Slot piv.Slot
-	Name string
+	Slot    piv.Slot
+	Name    string
+	Purpose SlotPurpose
 }
 
 type configFile struct {
-	Keyslots    []map[string]*string `yaml:"keyslots"`
-	Attestation bool                 `yaml:"attestation"`
+	Keyslots    []map[string]yaml.Node `yaml:"keyslots"`
+	Attestation bool                   `yaml:"attestation"`
 }
 
 type parsedConfig struct {
 	Slots       []slotConfig
 	Attestation bool
+}
+
+func parseSlotProperties(node *yaml.Node) (*slotConfig, error) {
+	if node == nil || node.Tag == "!!null" || (node.Kind == yaml.ScalarNode && node.Value == "") {
+		return nil, nil
+	}
+
+	if node.Kind != yaml.SequenceNode {
+		return nil, fmt.Errorf("expected a string, null, or list of properties, got YAML kind %d", node.Kind)
+	}
+
+	sc := &slotConfig{Purpose: PurposeSignature}
+	for _, item := range node.Content {
+		if item.Kind != yaml.MappingNode || len(item.Content) != 2 {
+			return nil, fmt.Errorf("expected a single-key mapping in slot property list")
+		}
+		key := item.Content[0].Value
+		val := item.Content[1].Value
+		switch key {
+		case "name":
+			sc.Name = val
+		case "purpose":
+			switch SlotPurpose(val) {
+			case PurposeSignature, PurposeEncryption:
+				sc.Purpose = SlotPurpose(val)
+			default:
+				return nil, fmt.Errorf("unknown purpose %q (must be %q or %q)", val, PurposeSignature, PurposeEncryption)
+			}
+		default:
+			return nil, fmt.Errorf("unknown slot property %q", key)
+		}
+	}
+	return sc, nil
 }
 
 func loadConfig(path string) (parsedConfig, error) {
@@ -64,7 +105,7 @@ func loadConfig(path string) (parsedConfig, error) {
 	// The config file is a YAML list. Each field (keyslots, attestation)
 	// may appear in any list item, or may be absent entirely. Merge across
 	// all items so that the order and grouping don't matter.
-	var allKeyslots []map[string]*string
+	var allKeyslots []map[string]yaml.Node
 	attestation := false
 	for _, item := range cfg {
 		if len(item.Keyslots) > 0 {
@@ -82,19 +123,24 @@ func loadConfig(path string) (parsedConfig, error) {
 	var slots []slotConfig
 	seen := make(map[string]bool)
 	for _, entry := range allKeyslots {
-		for name, socketName := range entry {
+		for name, node := range entry {
 			slot, ok := lookupSlot(name)
 			if !ok {
 				return parsedConfig{}, fmt.Errorf("unknown slot name %q (use a named slot like Authentication, Signature, KeyManagement, CardAuthentication, or a retired slot hex ID 82-95)", name)
 			}
-			if socketName == nil {
+			sc, err := parseSlotProperties(&node)
+			if err != nil {
+				return parsedConfig{}, fmt.Errorf("slot %q: %w", name, err)
+			}
+			if sc == nil {
 				continue // null value means skip this slot
 			}
-			if seen[*socketName] {
-				return parsedConfig{}, fmt.Errorf("duplicate socket name %q", *socketName)
+			sc.Slot = slot
+			if seen[sc.Name] {
+				return parsedConfig{}, fmt.Errorf("duplicate socket name %q", sc.Name)
 			}
-			seen[*socketName] = true
-			slots = append(slots, slotConfig{Slot: slot, Name: *socketName})
+			seen[sc.Name] = true
+			slots = append(slots, *sc)
 		}
 	}
 
@@ -105,7 +151,7 @@ func loadConfig(path string) (parsedConfig, error) {
 }
 
 func defaultSlotConfig() []slotConfig {
-	return []slotConfig{{Slot: piv.SlotAuthentication, Name: ""}}
+	return []slotConfig{{Slot: piv.SlotAuthentication, Name: "", Purpose: PurposeSignature}}
 }
 
 func socketPathForSlot(basePath string, sc slotConfig) string {
@@ -136,5 +182,5 @@ func slotForSetup(name string) (slotConfig, error) {
 	if !ok {
 		return slotConfig{}, fmt.Errorf("unknown slot name %q (use a named slot like Authentication, Signature, KeyManagement, CardAuthentication, or a retired slot hex ID 82-95)", name)
 	}
-	return slotConfig{Slot: slot, Name: name}, nil
+	return slotConfig{Slot: slot, Name: name, Purpose: PurposeSignature}, nil
 }
