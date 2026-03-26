@@ -42,7 +42,52 @@ func init() {
 	Version = "(unknown version)"
 }
 
+func parseTouchPolicy(s string) (piv.TouchPolicy, error) {
+	switch s {
+	case "always":
+		return piv.TouchPolicyAlways, nil
+	case "never":
+		return piv.TouchPolicyNever, nil
+	case "cached":
+		return piv.TouchPolicyCached, nil
+	default:
+		return 0, fmt.Errorf("invalid touch policy %q: must be \"always\", \"never\", or \"cached\"", s)
+	}
+}
+
+func touchPolicyLabel(tp piv.TouchPolicy) string {
+	switch tp {
+	case piv.TouchPolicyAlways:
+		return "always"
+	case piv.TouchPolicyNever:
+		return "never"
+	case piv.TouchPolicyCached:
+		return "cached (15s)"
+	default:
+		return "unknown"
+	}
+}
+
+func retrieveManagementKey(yk *piv.YubiKey) []byte {
+	fmt.Print("PIN: ")
+	pin, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Print("\n")
+	if err != nil {
+		log.Fatalln("Failed to read PIN:", err)
+	}
+	md, err := yk.Metadata(string(pin))
+	if err != nil {
+		log.Fatalln("Failed to retrieve management key (wrong PIN?):", err)
+	}
+	return *md.ManagementKey
+}
+
 func connectForSetup() *piv.YubiKey {
+	err := wslFindAndAttachYubiKey()
+	if err != nil {
+		log.Fatalln(err)
+	}
+
 	yk, err := openYK()
 	if err != nil {
 		log.Fatalln("Failed to connect to the YubiKey:", err)
@@ -82,7 +127,7 @@ func slotOccupied(yk *piv.YubiKey, slot piv.Slot) bool {
 	return false
 }
 
-func runSetupSlots(yk *piv.YubiKey, slots []slotConfig, forceOverwrite bool, attestation bool) {
+func runSetupSlots(yk *piv.YubiKey, slots []slotConfig, forceOverwrite bool, attestation bool, touchPolicy piv.TouchPolicy) {
 	// Check for occupied slots (based on what the user submitted in their config)
 	var occupied []slotConfig
 	for _, sc := range slots {
@@ -112,17 +157,7 @@ func runSetupSlots(yk *piv.YubiKey, slots []slotConfig, forceOverwrite bool, att
 		key = setupPINAndManagementKey(yk)
 	} else {
 		log.Println("Existing device configuration detected.")
-		fmt.Print("PIN: ")
-		pin, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Print("\n")
-		if err != nil {
-			log.Fatalln("Failed to read PIN:", err)
-		}
-		md, err := yk.Metadata(string(pin))
-		if err != nil {
-			log.Fatalln("Failed to retrieve management key (wrong PIN?):", err)
-		}
-		key = *md.ManagementKey
+		key = retrieveManagementKey(yk)
 	}
 
 	sigAlgorithm := piv.AlgorithmEC256
@@ -133,13 +168,20 @@ func runSetupSlots(yk *piv.YubiKey, slots []slotConfig, forceOverwrite bool, att
 		log.Println("ℹ️  Using ECDSA P-256 for signature and encryptionslots (Ed25519 requires firmware >= 5.7.0)")
 	}
 
+	if touchPolicy != piv.TouchPolicyAlways {
+		log.Printf("ℹ️  Touch policy: %s", touchPolicyLabel(touchPolicy))
+	}
 	for _, sc := range slots {
-		generateAndStoreKey(yk, key, sc, sigAlgorithm, attestation)
+		generateAndStoreKey(yk, key, sc, sigAlgorithm, attestation, touchPolicy)
 	}
 
 	fmt.Println("")
 	fmt.Println("✅ Done! This YubiKey is ready to go.")
-	fmt.Println("🤏 When the YubiKey blinks, touch it to authorize the login.")
+	if touchPolicy == piv.TouchPolicyAlways {
+		fmt.Println("🤏 When the YubiKey blinks, touch it to authorize the login.")
+	} else if touchPolicy == piv.TouchPolicyCached {
+		fmt.Println("🤏 When the YubiKey blinks, touch it to authorize the login (cached for 15s).")
+	}
 	fmt.Println("")
 	fmt.Println("Next steps: ensure yubikey-agent is running via launchd/systemd/...,")
 	fmt.Println(`set the SSH_AUTH_SOCK environment variable, and test with "ssh-add -L"`)
@@ -212,14 +254,14 @@ func setupPINAndManagementKey(yk *piv.YubiKey) []byte {
 	return key
 }
 
-func generateAndStoreKey(yk *piv.YubiKey, managementKey []byte, sc slotConfig, algorithm piv.Algorithm, attestation bool) {
+func generateAndStoreKey(yk *piv.YubiKey, managementKey []byte, sc slotConfig, algorithm piv.Algorithm, attestation bool, touchPolicy piv.TouchPolicy) {
 	if sc.Purpose == PurposeEncryption && supportsEd25519(yk) {
 		algorithm = piv.AlgorithmX25519
 	}
 	pub, err := yk.GenerateKey(managementKey, sc.Slot, piv.Key{
 		Algorithm:   algorithm,
 		PINPolicy:   piv.PINPolicyOnce,
-		TouchPolicy: piv.TouchPolicyAlways,
+		TouchPolicy: touchPolicy,
 	})
 	if err != nil {
 		log.Fatalln("Failed to generate key:", err)

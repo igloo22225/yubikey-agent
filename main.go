@@ -50,6 +50,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\t\tGenerate a key on a specific slot. Can be run on an already-\n")
 		fmt.Fprintf(os.Stderr, "\t\tprovisioned YubiKey to add a slot without wiping existing keys.\n")
 		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "\tyubikey-agent -setup -touch POLICY\n")
+		fmt.Fprintf(os.Stderr, "\t\tSet the touch policy for generated keys. POLICY is one of:\n")
+		fmt.Fprintf(os.Stderr, "\t\t  always  - require a physical touch for every operation (default)\n")
+		fmt.Fprintf(os.Stderr, "\t\t  never   - never require a touch\n")
+		fmt.Fprintf(os.Stderr, "\t\t  cached  - require a touch, then cache for 15 seconds\n")
+		fmt.Fprintf(os.Stderr, "\n")
 		fmt.Fprintf(os.Stderr, "\tyubikey-agent -setup -config CONFIG\n")
 		fmt.Fprintf(os.Stderr, "\t\tGenerate keys for all slots defined in the config file.\n")
 		fmt.Fprintf(os.Stderr, "\n")
@@ -89,6 +95,7 @@ func main() {
 	resetFlag := flag.Bool("really-delete-all-piv-keys", false, "setup: reset the PIV applet")
 	setupFlag := flag.Bool("setup", false, "setup: configure a new YubiKey")
 	setupSlot := flag.String("slot", "", "setup: PIV slot to configure (Authentication, Signature, KeyManagement, CardAuthentication, or retired slot 82-95)")
+	touchFlag := flag.String("touch", "always", `setup: touch policy for generated keys ("always", "never", or "cached")`)
 	dumpFlag := flag.Bool("dump", false, "dump: show all public keys on the connected YubiKey")
 	flag.Parse()
 
@@ -96,6 +103,8 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+
+	defer wslDetachLastConnectedBusID()
 
 	cfg := parsedConfig{Slots: defaultSlotConfig()}
 	if *configPath != "" {
@@ -112,6 +121,10 @@ func main() {
 		printKeys(yk, cfg.Slots, cfg.Attestation)
 	} else if *setupFlag {
 		log.SetFlags(0)
+		touchPolicy, err := parseTouchPolicy(*touchFlag)
+		if err != nil {
+			log.Fatalln(err)
+		}
 		yk := connectForSetup()
 		if *resetFlag {
 			runReset(yk)
@@ -121,9 +134,9 @@ func main() {
 			if err != nil {
 				log.Fatalln(err)
 			}
-			runSetupSlots(yk, []slotConfig{sc}, *resetFlag, cfg.Attestation)
+			runSetupSlots(yk, []slotConfig{sc}, *resetFlag, cfg.Attestation, touchPolicy)
 		} else {
-			runSetupSlots(yk, cfg.Slots, *resetFlag, cfg.Attestation)
+			runSetupSlots(yk, cfg.Slots, *resetFlag, cfg.Attestation, touchPolicy)
 		}
 	} else {
 		if *socketPath == "" {
@@ -273,6 +286,10 @@ func healthy(yk *piv.YubiKey) bool {
 }
 
 func (a *Agent) ensureYK() error {
+	err := wslFindAndAttachYubiKey()
+	if err != nil {
+		return err
+	}
 	if a.yks.yk == nil || !healthy(a.yks.yk) {
 		if a.yks.yk != nil {
 			log.Println("Reconnecting to the YubiKey...")
@@ -289,19 +306,6 @@ func (a *Agent) ensureYK() error {
 	return nil
 }
 
-func (a *Agent) maybeReleaseYK() {
-	// On macOS, YubiKey 5s persist the PIN cache even across sessions (and even
-	// processes), so we can release the lock on the key, to let other
-	// applications like age-plugin-yubikey use it.
-	if runtime.GOOS != "darwin" || a.yks.yk.Version().Major < 5 {
-		return
-	}
-	if err := a.yks.yk.Close(); err != nil {
-		log.Println("Failed to automatically release YubiKey lock:", err)
-	}
-	a.yks.yk = nil
-}
-
 func (a *Agent) connectToYK() (*piv.YubiKey, error) {
 	yk, err := openYK()
 	if err != nil {
@@ -314,6 +318,10 @@ func (a *Agent) connectToYK() (*piv.YubiKey, error) {
 }
 
 func openYK() (yk *piv.YubiKey, err error) {
+	err = wslFindAndAttachYubiKey()
+	if err != nil {
+		return nil, err
+	}
 	cards, err := piv.Cards()
 	if err != nil {
 		return nil, err
@@ -355,10 +363,14 @@ func (a *Agent) getPIN() (string, error) {
 func (a *Agent) List() ([]*agent.Key, error) {
 	a.yks.mu.Lock()
 	defer a.yks.mu.Unlock()
+
+	if err := wslFindAndAttachYubiKey(); err != nil {
+		return nil, err
+	}
+
 	if err := a.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
-	defer a.maybeReleaseYK()
 
 	pk, err := getPublicKey(a.yks.yk, a.slot)
 	if err != nil {
@@ -415,10 +427,14 @@ func getCryptoPublicKey(yk *piv.YubiKey, slot piv.Slot) (crypto.PublicKey, error
 func (a *Agent) Signers() ([]ssh.Signer, error) {
 	a.yks.mu.Lock()
 	defer a.yks.mu.Unlock()
+
+	if err := wslFindAndAttachYubiKey(); err != nil {
+		return nil, err
+	}
+
 	if err := a.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
-	defer a.maybeReleaseYK()
 
 	s, err := a.signer()
 	if err != nil {
@@ -454,10 +470,15 @@ func (a *Agent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
 	a.yks.mu.Lock()
 	defer a.yks.mu.Unlock()
+
+	if err := wslFindAndAttachYubiKey(); err != nil {
+		return nil, err
+	}
+
 	if err := a.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
-	defer a.maybeReleaseYK()
+	defer wslDetachLastConnectedBusID()
 
 	s, err := a.signer()
 	if err != nil {
