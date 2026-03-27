@@ -8,7 +8,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto"
 	"crypto/ecdh"
 	"crypto/ecdsa"
@@ -37,6 +36,10 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/terminal"
 )
+
+var existingNotificationChannel chan bool
+
+var quietNotify bool
 
 func main() {
 	flag.Usage = func() {
@@ -81,6 +84,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\t\tnamed \"main\" creates /tmp/agent.sock-main). A slot with an\n")
 		fmt.Fprintf(os.Stderr, "\t\tempty name (\"\") uses PATH as-is, with no suffix.\n")
 		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "  Quiet:\n")
+		fmt.Fprintf(os.Stderr, "\tyubikey-agent -q\n")
+		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "\t\t(Darwin only) don't beep on press notifications.\n")
+		fmt.Fprintf(os.Stderr, "\n")
 		fmt.Fprintf(os.Stderr, "  Slots:\n")
 		fmt.Fprintf(os.Stderr, "\tAuthentication     9a   (default when no config is provided)\n")
 		fmt.Fprintf(os.Stderr, "\tSignature          9c\n")
@@ -97,11 +105,16 @@ func main() {
 	setupSlot := flag.String("slot", "", "setup: PIV slot to configure (Authentication, Signature, KeyManagement, CardAuthentication, or retired slot 82-95)")
 	touchFlag := flag.String("touch", "always", `setup: touch policy for generated keys ("always", "never", or "cached")`)
 	dumpFlag := flag.Bool("dump", false, "dump: show all public keys on the connected YubiKey")
+	quietFlag := flag.Bool("q", false, "quiet: Don't send beep on alert.")
 	flag.Parse()
 
 	if flag.NArg() > 0 {
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	if *quietFlag {
+		quietNotify = true
 	}
 
 	defer wslDetachLastConnectedBusID()
@@ -263,11 +276,6 @@ type Agent struct {
 	yks        *ykSession
 	slot       piv.Slot
 	slotConfig slotConfig
-
-	// touchNotification is armed by Sign to show a notification if waiting for
-	// more than a few seconds for the touch operation. It is paused and reset
-	// by getPIN so it won't fire while waiting for the PIN.
-	touchNotification *time.Timer
 }
 
 var _ agent.ExtendedAgent = &Agent{}
@@ -353,11 +361,23 @@ func (a *Agent) Close() error {
 }
 
 func (a *Agent) getPIN() (string, error) {
-	if a.touchNotification != nil && a.touchNotification.Stop() {
-		defer a.touchNotification.Reset(5 * time.Second)
-	}
 	r, _ := a.yks.yk.Retries()
-	return getPIN(a.yks.serial, r)
+
+	// attempt to remove the notification if there's a PIN prompt and notify again later
+	removeNotification()
+
+	pin, err := getPIN(a.yks.serial, r)
+
+	// re-notify if a PIN was successfully entered (not cancelled, or errored)
+	if err == nil {
+		err := showNotification()
+		if err != nil {
+			// notification failure is not a hard failure
+			log.Println("Re-notify failed:", err)
+		}
+	}
+
+	return pin, err
 }
 
 func (a *Agent) List() ([]*agent.Key, error) {
@@ -510,18 +530,12 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 			slotDisplayName(a.slotConfig))
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	a.touchNotification = time.NewTimer(5 * time.Second)
-	go func() {
-		select {
-		case <-a.touchNotification.C:
-		case <-ctx.Done():
-			a.touchNotification.Stop()
-			return
-		}
-		showNotification("Waiting for YubiKey touch...")
-	}()
+	err = showNotification()
+	if err != nil {
+		// notification failure is not a hard failure
+		log.Println("Notify failed:", err)
+	}
+	defer removeNotification()
 
 	alg := key.Type()
 	switch {
@@ -535,20 +549,108 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 		alg = KeyAlgoECDHX25519
 	}
 
-	// TODO: maybe retry if the PIN is not correct?
-	return s.SignWithAlgorithm(rand.Reader, data, alg)
+	log.Printf("Signature requested using key: %s / %s", ssh.MarshalAuthorizedKey(key), slotDisplayName(a.slotConfig))
+
+	var signature *ssh.Signature
+	for {
+		signature, err = s.SignWithAlgorithm(rand.Reader, data, alg)
+		if err == nil || strings.Contains(err.Error(), "cancelled") || strings.Contains(err.Error(), "exit status 1") {
+			break
+		}
+	}
+	return signature, err
 }
 
-func showNotification(message string) {
+func removeNotification() {
+	if existingNotificationChannel != nil {
+		existingNotificationChannel <- true
+	}
+}
+
+func showNotification() error {
+	if existingNotificationChannel != nil {
+		return errors.New("there is already an active notification")
+	}
+
+	title := "YubiKey-Agent touch requested"
+	message := "Please touch your YubiKey now."
+
+	legacyMode := false
+	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
 		message = strings.ReplaceAll(message, `\`, `\\`)
 		message = strings.ReplaceAll(message, `"`, `\"`)
-		appleScript := `display notification "%s" with title "yubikey-agent"`
-		exec.Command("osascript", "-e", fmt.Sprintf(appleScript, message)).Run()
+		osascript, err := exec.LookPath("osascript")
+		if err != nil {
+			return errors.New("failed to find osascript for notification sending")
+		}
+		button := "This alert will automatically clear itself."
+		appleScript := `display dialog "%s" buttons "%s" with title "%s"`
+		var commandArgs []string
+		if !quietNotify {
+			commandArgs = []string{"-e", "beep"}
+		}
+		cmd = exec.Command(osascript, append(
+			commandArgs, "-e", fmt.Sprintf(appleScript, message, button, title))...,
+		)
 	case "linux":
-		exec.Command("notify-send", "-i", "dialog-password", "yubikey-agent", message).Run()
+		// check for WSL
+		powershell, err := exec.LookPath(wslPathToPowershell)
+		if err == nil {
+			psCmd := `$wshShell = New-Object -ComObject WScript.Shell
+$options = 0x0 + 0x30 + 0x1000 # OK button + exclamation icon + always-on-top
+$wshShell.Popup("%s", 0, "%s", $options)`
+			psCmd = fmt.Sprintf(psCmd, message, title)
+			cmd = wslGeneratePowershellCmd(powershell, psCmd)
+		} else {
+			notifySend, err := exec.LookPath("notify-send")
+			if err != nil {
+				return errors.New("failed to find notify-send for notification sending")
+			}
+			notifySendVersion, err := exec.Command(notifySend, "-v").Output()
+			if err != nil {
+				return errors.New("failed to get notify-send version")
+			}
+			if bytes.Contains(notifySendVersion, []byte(" 0.7")) {
+				// notify-send 0.7 on Ubuntu 22.04 unfortunately does not support --wait and therefore
+				// does not support management of the notification.
+				legacyMode = true
+				title = "YubiKey-Agent activated"
+				message = "Reminder to touch your YubiKey."
+				cmd = exec.Command(notifySend, "-i", "dialog-password", title, message)
+			} else {
+				cmd = exec.Command(notifySend, "-i", "dialog-password", "--expire-time", "0", "--wait", title, message)
+			}
+		}
 	}
+
+	if cmd == nil {
+		return errors.New("failed to determine notification command for operating system")
+	}
+
+	err := cmd.Start()
+	if err != nil {
+		return errors.New("failed to execute notification command")
+	}
+
+	go func() {
+		if !legacyMode {
+			existingNotificationChannel = make(chan bool, 1)
+			select {
+			// Yubikey typically times out after 15 seconds, so this is unlikely to hit
+			case <-time.After(20 * time.Second):
+				log.Println("Notification timed out")
+			case <-existingNotificationChannel:
+			}
+			// clears the notification when done on both macOS and Ubuntu 24.04 onwards
+			_ = cmd.Process.Signal(os.Interrupt)
+		}
+		existingNotificationChannel = nil
+		_ = cmd.Wait() // required to prevent zombie defunct processes
+	}()
+
+	return nil
 }
 
 func (a *Agent) Extension(extensionType string, contents []byte) ([]byte, error) {
