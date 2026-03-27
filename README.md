@@ -77,7 +77,8 @@ Install the [`yubikey-agent` port](https://svnweb.freebsd.org/ports/head/securit
 
 ### Windows
 
-Windows support is currently WIP.
+Windows is supported via WSL. Testing has been performed on Ubuntu 22.04.5 / Debian Bookworm WSL instances; your mileage will vary for other ditributions.
+Yubikeys are attached via [usbipd-win](https://github.com/dorssel/usbipd-win), which must be installed on the host prior to usage. WSL instances must be on kernel 5.10.60.1 or newer.
 
 ## Advanced topics
 
@@ -102,6 +103,20 @@ Host *
     IdentityAgent /usr/local/var/run/yubikey-agent.sock
 ```
 
+### Multiple PIV Keys
+
+Yubikeys contain at least 4 keyslots, with keys on firmware >= 4.0 having 24 keyslots. Keyslots are configured in the optional configuration file:
+
+```
+- keyslots:
+  - Authentication:
+    - name: "main"
+    - purpose: "signature"
+```
+Keyslots may be used for one of two types of keys: signature, primarily used for SSH, and ECDH, used for seperate applications (ex. age).
+
+If multiple keyslots are used, the configured socket path will be treated as a prefix rather than as a specific path. For example, given `-l /opt/homebrew/var/run/yubikey-agent`, the agent would place the main socket in `/opt/homebrew/var/run/yubikey-agent-main`.
+
 ### Conflicts with `gpg-agent` and Yubikey Manager
 
 `yubikey-agent` takes a persistent transaction so the YubiKey will cache the PIN after first use. Unfortunately, this makes the YubiKey PIV and PGP applets unavailable to any other applications, like `gpg-agent` and Yubikey Manager. Our upstream [is investigating solutions to this annoyance](https://github.com/go-piv/piv-go/issues/47).
@@ -113,6 +128,14 @@ ssh-add -D
 ```
 
 This does not affect the FIDO2 functionality.
+
+### ECDH
+
+While the agent is active, `yubikey-agent` holds a persistent transaction, necessitating that it be temporarily disabled for other applications (ex. [age-plugin-yubikey](https://github.com/str4d/age-plugin-yubikey)) to function as expected.
+
+To alleviate the pain of swapping back and forth, `yubikey-agent` supports ECDH requests in additional to traditional SSH socket operations. For ECDH using NIST P-256, requests should be sent using SSH agent flag `0x40000000`, while X25519 requests should be sent using flag `0x20000000`. 
+
+Keys must be configured as encryption keys in the PIV configuration. X25519 keys must be generated as X25519 keys; Yubikey-hosted ED25519 keys cannot be used for ECDH.
 
 ### Changing PIN and PUK
 
@@ -137,6 +160,22 @@ ykman piv access unblock-pin
 ```
 
 If the PUK is also entered incorrectly three times, the key is permanently irrecoverable. The YubiKey PIV applet can be reset with `yubikey-agent --setup --really-delete-all-piv-keys`.
+
+### Key Attestations
+
+Keys generated on-yubikey can receive an attestation certificate verifying that the key was generated on-device, the policy of the key (i.e. is touch required / is a pin required) and some details about the yubikey (serial, version, etc...).
+The public key of the attestation certificate is the same public key provided by Yubikey-agent, allowing a third party to verify that a paticular key was generated in accordance with a paticular policy.
+
+`yubikey-agent` can produce attestation information as two base64-encoded certificates seperated by a pipe. The first is the per-key certificate while the second is a per-device intermediate. Copies of the root certificate can be found on [Yubico's website](https://developers.yubico.com/PIV/Introduction/PIV_attestation.html).
+
+Key attestation is toggled in the optional agent config:
+
+```
+# attestation: when true, attestation certificates are printed during key generation (-setup) and when dumping keys (-dump). The attestation string
+# contains the base64-encoded attestation and intermediate certificates separated by a pipe (|). These certificates can be used to verify whether
+# a paticular public key was generated on Yubikey hardware and the relevant key policies. Default: false.
+- attestation: false
+```
 
 ### Manual setup and technical details
 
